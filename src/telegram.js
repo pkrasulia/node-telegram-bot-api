@@ -7,8 +7,16 @@ const TelegramBotPolling = require('./telegramPolling');
 const debug = require('debug')('node-telegram-bot-api');
 const EventEmitter = require('eventemitter3');
 const fileType = require('file-type');
-const request = require('@cypress/request-promise');
-const streamedRequest = require('@cypress/request');
+// fetch + multipart helpers
+let fetch = global.fetch;
+try {
+  if (!fetch) {
+    fetch = require('undici').fetch;
+  }
+} catch (e) {
+  void e;
+}
+const FormDataNode = require('form-data');
 const qs = require('querystring');
 const stream = require('stream');
 const mime = require('mime');
@@ -55,11 +63,12 @@ const _messageTypes = [
   'chat_invite_link',
   'chat_member_updated',
   'web_app_data',
-  'message_reaction'
+  'message_reaction',
 ];
 
 const _deprecatedMessageTypes = [
-  'new_chat_participant', 'left_chat_participant'
+  'new_chat_participant',
+  'left_chat_participant',
 ];
 
 /**
@@ -75,7 +84,6 @@ function stringify(data) {
   }
   return JSON.stringify(data);
 }
-
 
 class TelegramBot extends EventEmitter {
   /**
@@ -104,8 +112,13 @@ class TelegramBot extends EventEmitter {
    */
   on(event, listener) {
     if (_deprecatedMessageTypes.indexOf(event) !== -1) {
-      const url = 'https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#events';
-      deprecate(`Events ${_deprecatedMessageTypes.join(',')} are deprecated. See the updated list of events: ${url}`);
+      const url =
+        'https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#events';
+      deprecate(
+        `Events ${_deprecatedMessageTypes.join(
+          ','
+        )} are deprecated. See the updated list of events: ${url}`
+      );
     }
     super.on(event, listener);
   }
@@ -162,11 +175,17 @@ class TelegramBot extends EventEmitter {
     super();
     this.token = token;
     this.options = options;
-    this.options.polling = (typeof options.polling === 'undefined') ? false : options.polling;
-    this.options.webHook = (typeof options.webHook === 'undefined') ? false : options.webHook;
+    this.options.polling =
+      typeof options.polling === 'undefined' ? false : options.polling;
+    this.options.webHook =
+      typeof options.webHook === 'undefined' ? false : options.webHook;
     this.options.baseApiUrl = options.baseApiUrl || 'https://api.telegram.org';
-    this.options.filepath = (typeof options.filepath === 'undefined') ? true : options.filepath;
-    this.options.badRejection = (typeof options.badRejection === 'undefined') ? false : options.badRejection;
+    this.options.filepath =
+      typeof options.filepath === 'undefined' ? true : options.filepath;
+    this.options.badRejection =
+      typeof options.badRejection === 'undefined'
+        ? false
+        : options.badRejection;
     this._textRegexpCallbacks = [];
     this._replyListenerId = 0;
     this._replyListeners = [];
@@ -196,7 +215,9 @@ class TelegramBot extends EventEmitter {
    * @see https://core.telegram.org/bots/api#making-requests
    */
   _buildURL(_path) {
-    return `${this.options.baseApiUrl}/bot${this.token}${this.options.testEnvironment ? '/test' : ''}/${_path}`;
+    return `${this.options.baseApiUrl}/bot${this.token}${
+      this.options.testEnvironment ? '/test' : ''
+    }/${_path}`;
   }
 
   /**
@@ -246,7 +267,10 @@ class TelegramBot extends EventEmitter {
       }
 
       const attachName = 'photo';
-      const [formData] = this._formatSendData(attachName, options.thumb.replace('attach://', ''));
+      const [formData] = this._formatSendData(
+        attachName,
+        options.thumb.replace('attach://', '')
+      );
 
       if (formData) {
         opts.formData[attachName] = formData[attachName];
@@ -263,7 +287,10 @@ class TelegramBot extends EventEmitter {
    * @see https://core.telegram.org/bots/api#sendmessage
    */
   _fixReplyParameters(obj) {
-    if (obj.hasOwnProperty('reply_parameters') && typeof obj.reply_parameters !== 'string') {
+    if (
+      obj.hasOwnProperty('reply_parameters') &&
+      typeof obj.reply_parameters !== 'string'
+    ) {
       obj.reply_parameters = stringify(obj.reply_parameters);
     }
   }
@@ -277,7 +304,9 @@ class TelegramBot extends EventEmitter {
    */
   _request(_path, options = {}) {
     if (!this.token) {
-      return Promise.reject(new errors.FatalError('Telegram Bot Token not provided!'));
+      return Promise.reject(
+        new errors.FatalError('Telegram Bot Token not provided!')
+      );
     }
 
     if (this.options.request) {
@@ -294,28 +323,68 @@ class TelegramBot extends EventEmitter {
       this._fixReplyParameters(options.qs);
     }
 
-    options.method = 'POST';
-    options.url = this._buildURL(_path);
-    options.simple = false;
-    options.resolveWithFullResponse = true;
-    options.forever = true;
-    debug('HTTP request: %j', options);
-    return request(options)
-      .then(resp => {
+    const method = 'POST';
+    const urlBase = this._buildURL(_path);
+    const headers = Object.assign(
+      {},
+      (this.options.request && this.options.request.headers) || {}
+    );
+
+    // Build URL with query string params if provided
+    let url = urlBase;
+    if (options.qs && Object.keys(options.qs).length > 0) {
+      const qsString = qs.stringify(options.qs);
+      url += (url.indexOf('?') === -1 ? '?' : '&') + qsString;
+    }
+
+    // Build body
+    let body;
+    if (options.formData) {
+      const formData = new FormDataNode();
+      Object.keys(options.formData).forEach((key) => {
+        const entry = options.formData[key];
+        if (entry && entry.value !== undefined) {
+          const appendOptions = Object.assign({}, entry.options || {});
+          formData.append(key, entry.value, appendOptions);
+        }
+      });
+      Object.assign(headers, formData.getHeaders());
+      body = formData;
+    } else if (options.form) {
+      body = qs.stringify(options.form);
+      headers['content-type'] = 'application/x-www-form-urlencoded';
+    }
+
+    const fetchOptions = { method, headers, body };
+    debug('HTTP request: %j', {
+      method,
+      url,
+      headers: Object.keys(headers),
+      hasBody: !!body,
+    });
+    return Promise.resolve()
+      .then(() => fetch(url, fetchOptions))
+      .then(async (res) => {
+        const text = await res.text();
         let data;
         try {
-          data = resp.body = JSON.parse(resp.body);
+          data = JSON.parse(text);
         } catch (err) {
-          throw new errors.ParseError(`Error parsing response: ${resp.body}`, resp);
+          throw new errors.ParseError(`Error parsing response: ${text}`, {
+            statusCode: res.status,
+            body: text,
+          });
         }
-
         if (data.ok) {
           return data.result;
         }
-
-        throw new errors.TelegramError(`${data.error_code} ${data.description}`, resp);
-      }).catch(error => {
-        // TODO: why can't we do `error instanceof errors.BaseError`?
+        const resp = { statusCode: res.status, body: text };
+        throw new errors.TelegramError(
+          `${data.error_code} ${data.description}`,
+          resp
+        );
+      })
+      .catch((error) => {
         if (error.response) throw error;
         throw new errors.FatalError(error);
       });
@@ -355,7 +424,9 @@ class TelegramBot extends EventEmitter {
       }
     } else if (Buffer.isBuffer(data)) {
       if (!filename && !process.env.NTBA_FIX_350) {
-        deprecate(`Buffers will have their filenames default to "filename" instead of "data". ${deprecationMessage}`);
+        deprecate(
+          `Buffers will have their filenames default to "filename" instead of "data". ${deprecationMessage}`
+        );
         filename = 'data';
       }
       if (!contentType) {
@@ -367,7 +438,9 @@ class TelegramBot extends EventEmitter {
             filename = `${filename}.${ext}`;
           }
         } else if (!process.env.NTBA_FIX_350) {
-          deprecate(`An error will no longer be thrown if file-type of buffer could not be detected. ${deprecationMessage}`);
+          deprecate(
+            `An error will no longer be thrown if file-type of buffer could not be detected. ${deprecationMessage}`
+          );
           throw new errors.FatalError('Unsupported Buffer file-type');
         }
       }
@@ -389,22 +462,26 @@ class TelegramBot extends EventEmitter {
     if (process.env.NTBA_FIX_350) {
       contentType = contentType || 'application/octet-stream';
     } else {
-      deprecate(`In the future, content-type of files you send will default to "application/octet-stream". ${deprecationMessage}`);
+      deprecate(
+        `In the future, content-type of files you send will default to "application/octet-stream". ${deprecationMessage}`
+      );
     }
 
     // TODO: Add missing file extension.
 
-    return [{
-      [type]: {
-        value: filedata,
-        options: {
-          filename,
-          contentType,
+    return [
+      {
+        [type]: {
+          value: filedata,
+          options: {
+            filename,
+            contentType,
+          },
         },
       },
-    }, null];
+      null,
+    ];
   }
-
 
   /**
    * Format multiple files to be uploaded; handles file paths, streams, and buffers
@@ -487,9 +564,12 @@ class TelegramBot extends EventEmitter {
    */
   startPolling(options = {}) {
     if (this.hasOpenWebHook()) {
-      return Promise.reject(new errors.FatalError('Polling and WebHook are mutually exclusive'));
+      return Promise.reject(
+        new errors.FatalError('Polling and WebHook are mutually exclusive')
+      );
     }
-    options.restart = typeof options.restart === 'undefined' ? true : options.restart;
+    options.restart =
+      typeof options.restart === 'undefined' ? true : options.restart;
     if (!this._polling) {
       this._polling = new TelegramBotPolling(this);
     }
@@ -503,7 +583,9 @@ class TelegramBot extends EventEmitter {
    * @deprecated
    */
   initPolling() {
-    deprecate('TelegramBot#initPolling() is deprecated. Use TelegramBot#startPolling() instead.');
+    deprecate(
+      'TelegramBot#initPolling() is deprecated. Use TelegramBot#startPolling() instead.'
+    );
     return this.startPolling();
   }
 
@@ -537,8 +619,10 @@ class TelegramBot extends EventEmitter {
    * @see https://core.telegram.org/bots/api#getfile
    */
   getFileLink(fileId, form = {}) {
-    return this.getFile(fileId, form)
-      .then(resp => `${this.options.baseApiUrl}/file/bot${this.token}/${resp.file_path}`);
+    return this.getFile(fileId, form).then(
+      (resp) =>
+        `${this.options.baseApiUrl}/file/bot${this.token}/${resp.file_path}`
+    );
   }
 
   /**
@@ -564,7 +648,25 @@ class TelegramBot extends EventEmitter {
         fileStream.emit('info', {
           uri: fileURI,
         });
-        pump(streamedRequest(Object.assign({ uri: fileURI }, this.options.request)), fileStream);
+        const headers =
+          (this.options.request && this.options.request.headers) || {};
+        return fetch(fileURI, { method: 'GET', headers }).then((res) => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          const body = res.body;
+          let nodeReadable;
+          if (
+            body &&
+            typeof body.getReader === 'function' &&
+            stream.Readable.fromWeb
+          ) {
+            nodeReadable = stream.Readable.fromWeb(body);
+          } else {
+            nodeReadable = body;
+          }
+          pump(nodeReadable, fileStream);
+        });
       })
       .catch((error) => {
         fileStream.emit('error', error);
@@ -596,7 +698,9 @@ class TelegramBot extends EventEmitter {
       // TODO: Ensure fileName doesn't contains slashes
       const filePath = path.join(downloadDir, fileName);
       pump(fileStream, fs.createWriteStream(filePath), (error) => {
-        if (error) { return reject(error); }
+        if (error) {
+          return reject(error);
+        }
         return resolve(filePath);
       });
     });
@@ -655,7 +759,7 @@ class TelegramBot extends EventEmitter {
       id,
       chatId,
       messageId,
-      callback
+      callback,
     });
     return id;
   }
@@ -704,7 +808,9 @@ class TelegramBot extends EventEmitter {
    */
   openWebHook() {
     if (this.isPolling()) {
-      return Promise.reject(new errors.FatalError('WebHook and Polling are mutually exclusive'));
+      return Promise.reject(
+        new errors.FatalError('WebHook and Polling are mutually exclusive')
+      );
     }
     if (!this._webHook) {
       this._webHook = new TelegramBotWebHook(this);
@@ -734,7 +840,6 @@ class TelegramBot extends EventEmitter {
   hasOpenWebHook() {
     return this._webHook ? this._webHook.isOpen() : false;
   }
-
 
   /**
    * Process an update; emitting the proper events and executing regexp
@@ -770,7 +875,6 @@ class TelegramBot extends EventEmitter {
     const chatBoost = update.chat_boost;
     const removedChatBoost = update.removed_chat_boost;
 
-
     if (message) {
       debug('Process Update message %j', message);
       const metadata = {};
@@ -784,7 +888,7 @@ class TelegramBot extends EventEmitter {
       }
       if (message.text) {
         debug('Text message');
-        this._textRegexpCallbacks.some(reg => {
+        this._textRegexpCallbacks.some((reg) => {
           debug('Matching %s with %s', message.text, reg.regexp);
 
           if (!(reg.regexp instanceof RegExp)) {
@@ -805,7 +909,7 @@ class TelegramBot extends EventEmitter {
       }
       if (message.reply_to_message) {
         // Only callbacks waiting for this message
-        this._replyListeners.forEach(reply => {
+        this._replyListeners.forEach((reply) => {
           // Message from the same chat
           if (reply.chatId === message.chat.id) {
             // Responding to that message
@@ -847,7 +951,10 @@ class TelegramBot extends EventEmitter {
       debug('Process Update edited_business_message %j', editedBusinessMessage);
       this.emit('edited_business_message', editedBusinessMessage);
     } else if (deletedBusinessMessage) {
-      debug('Process Update deleted_business_messages %j', deletedBusinessMessage);
+      debug(
+        'Process Update deleted_business_messages %j',
+        deletedBusinessMessage
+      );
       this.emit('deleted_business_messages', deletedBusinessMessage);
     } else if (messageReaction) {
       debug('Process Update message_reaction %j', messageReaction);
@@ -900,21 +1007,23 @@ class TelegramBot extends EventEmitter {
   /** Start Telegram Bot API methods */
 
   /**
-  * Use this method to receive incoming updates using long polling.
-  * This method has an [older, compatible signature][getUpdates-v0.25.0]
-  * that is being deprecated.
-  *
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise}
-  * @see https://core.telegram.org/bots/api#getupdates
-  */
+   * Use this method to receive incoming updates using long polling.
+   * This method has an [older, compatible signature][getUpdates-v0.25.0]
+   * that is being deprecated.
+   *
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise}
+   * @see https://core.telegram.org/bots/api#getupdates
+   */
   getUpdates(form = {}) {
     /* The older method signature was getUpdates(timeout, limit, offset).
      * We need to ensure backwards-compatibility while maintaining
      * consistency of the method signatures throughout the library */
     if (typeof form !== 'object') {
       /* eslint-disable no-param-reassign, prefer-rest-params */
-      deprecate('The method signature getUpdates(timeout, limit, offset) has been deprecated since v0.25.0');
+      deprecate(
+        'The method signature getUpdates(timeout, limit, offset) has been deprecated since v0.25.0'
+      );
       form = {
         timeout: arguments[0],
         limit: arguments[1],
@@ -948,7 +1057,9 @@ class TelegramBot extends EventEmitter {
     let cert;
     // Note: 'options' could be an object, if a stream was provided (in place of 'cert')
     if (typeof options !== 'object' || options instanceof stream.Stream) {
-      deprecate('The method signature setWebHook(url, cert) has been deprecated since v0.25.0');
+      deprecate(
+        'The method signature setWebHook(url, cert) has been deprecated since v0.25.0'
+      );
       cert = options;
       options = {}; // eslint-disable-line no-param-reassign
     } else {
@@ -1153,22 +1264,22 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Send audio
-  *
-  * **Your audio must be in the .MP3 or .M4A format.**
-  *
-  * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {String|stream.Stream|Buffer} audio A file path, Stream or Buffer.
-  * Can also be a `file_id` previously uploaded.
-  * @param {Object} [options] Additional Telegram query options
-  * @param {Object} [fileOptions] Optional file related meta-data
-  * @return {Promise} On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned
-  * @see https://core.telegram.org/bots/api#sendaudio
-  * @see https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#sending-files
-  */
+   * Send audio
+   *
+   * **Your audio must be in the .MP3 or .M4A format.**
+   *
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {String|stream.Stream|Buffer} audio A file path, Stream or Buffer.
+   * Can also be a `file_id` previously uploaded.
+   * @param {Object} [options] Additional Telegram query options
+   * @param {Object} [fileOptions] Optional file related meta-data
+   * @return {Promise} On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned
+   * @see https://core.telegram.org/bots/api#sendaudio
+   * @see https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#sending-files
+   */
   sendAudio(chatId, audio, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
 
     opts.qs.chat_id = chatId;
@@ -1186,19 +1297,19 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Send Document
-  * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {String|stream.Stream|Buffer} doc A file path, Stream or Buffer.
-  * Can also be a `file_id` previously uploaded.
-  * @param {Object} [options] Additional Telegram query options
-  * @param {Object} [fileOptions] Optional file related meta-data
-  * @return {Promise}  On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned
-  * @see https://core.telegram.org/bots/api#sendDocument
-  * @see https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#sending-files
-  */
+   * Send Document
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {String|stream.Stream|Buffer} doc A file path, Stream or Buffer.
+   * Can also be a `file_id` previously uploaded.
+   * @param {Object} [options] Additional Telegram query options
+   * @param {Object} [fileOptions] Optional file related meta-data
+   * @return {Promise}  On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned
+   * @see https://core.telegram.org/bots/api#sendDocument
+   * @see https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#sending-files
+   */
   sendDocument(chatId, doc, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
@@ -1227,7 +1338,7 @@ class TelegramBot extends EventEmitter {
    */
   sendVideo(chatId, video, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
@@ -1254,11 +1365,15 @@ class TelegramBot extends EventEmitter {
    */
   sendAnimation(chatId, animation, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
-      const sendData = this._formatSendData('animation', animation, fileOptions);
+      const sendData = this._formatSendData(
+        'animation',
+        animation,
+        fileOptions
+      );
       opts.formData = sendData[0];
       opts.qs.animation = sendData[1];
     } catch (ex) {
@@ -1282,7 +1397,7 @@ class TelegramBot extends EventEmitter {
    */
   sendVoice(chatId, voice, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
@@ -1307,14 +1422,18 @@ class TelegramBot extends EventEmitter {
    * @info The length parameter is actually optional. However, the API (at time of writing) requires you to always provide it until it is fixed.
    * @see https://core.telegram.org/bots/api#sendvideonote
    * @see https://github.com/yagop/node-telegram-bot-api/blob/master/doc/usage.md#sending-files
-  */
+   */
   sendVideoNote(chatId, videoNote, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
-      const sendData = this._formatSendData('video_note', videoNote, fileOptions);
+      const sendData = this._formatSendData(
+        'video_note',
+        videoNote,
+        fileOptions
+      );
       opts.formData = sendData[0];
       opts.qs.video_note = sendData[1];
       this._fixAddFileThumbnail(options, opts);
@@ -1332,10 +1451,10 @@ class TelegramBot extends EventEmitter {
    * @param {Object} [options] Additional Telegram query options
    * @return {Promise} On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned
    * @see https://core.telegram.org/bots/api#sendpaidmedia
-  */
+   */
   sendPaidMedia(chatId, starCount, media, options = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
 
     opts.qs.chat_id = chatId;
@@ -1345,18 +1464,23 @@ class TelegramBot extends EventEmitter {
       const inputPaidMedia = [];
       opts.formData = {};
 
-      const { formData, fileIds } = this._formatSendMultipleData('media', media);
+      const { formData, fileIds } = this._formatSendMultipleData(
+        'media',
+        media
+      );
 
       opts.formData = formData;
 
-      inputPaidMedia.push(...media.map((item, index) => {
-        if (fileIds[index]) {
-          item.media = fileIds[index];
-        } else {
-          item.media = `attach://media_${index}`;
-        }
-        return item;
-      }));
+      inputPaidMedia.push(
+        ...media.map((item, index) => {
+          if (fileIds[index]) {
+            item.media = fileIds[index];
+          } else {
+            item.media = `attach://media_${index}`;
+          }
+          return item;
+        })
+      );
 
       opts.qs.media = stringify(inputPaidMedia);
     } catch (ex) {
@@ -1397,7 +1521,11 @@ class TelegramBot extends EventEmitter {
       delete payload.fileOptions;
       try {
         const attachName = String(index);
-        const [formData, fileId] = this._formatSendData(attachName, input.media, input.fileOptions);
+        const [formData, fileId] = this._formatSendData(
+          attachName,
+          input.media,
+          input.fileOptions
+        );
         if (formData) {
           opts.formData[attachName] = formData[attachName];
           payload.media = `attach://${attachName}`;
@@ -1414,7 +1542,6 @@ class TelegramBot extends EventEmitter {
 
     return this._request('sendMediaGroup', opts);
   }
-
 
   /**
    * Send location.
@@ -1568,7 +1695,6 @@ class TelegramBot extends EventEmitter {
     return this._request('sendDice', opts);
   }
 
-
   /**
    * Send chat action.
    *
@@ -1632,7 +1758,9 @@ class TelegramBot extends EventEmitter {
      * consistency of the method signatures throughout the library */
     if (typeof form !== 'object') {
       /* eslint-disable no-param-reassign, prefer-rest-params */
-      deprecate('The method signature getUserProfilePhotos(userId, offset, limit) has been deprecated since v0.25.0');
+      deprecate(
+        'The method signature getUserProfilePhotos(userId, offset, limit) has been deprecated since v0.25.0'
+      );
       form = {
         offset: arguments[1],
         limit: arguments[2],
@@ -1651,7 +1779,7 @@ class TelegramBot extends EventEmitter {
    * @param {Object} [options] Additional Telegram query options
    * @return {Promise} True on success
    * @see https://core.telegram.org/bots/api#setuseremojistatus
-  */
+   */
   setUserEmojiStatus(userId, form = {}) {
     form.user_id = userId;
     return this._request('setUserEmojiStatus', { form });
@@ -1674,19 +1802,19 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-    * Use this method to ban a user in a group, a supergroup or a channel.
-    * In the case of supergroups and channels, the user will not be able to
-    * return to the chat on their own using invite links, etc., unless unbanned first..
-    *
-    * The **bot must be an administrator in the group, supergroup or a channel** for this to work.
-    *
-    *
-    * @param {Number|String} chatId   Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-    * @param {Number} userId  Unique identifier of the target user
-    * @param {Object} [options] Additional Telegram query options
-    * @return {Promise} True on success.
-    * @see https://core.telegram.org/bots/api#banchatmember
-    */
+   * Use this method to ban a user in a group, a supergroup or a channel.
+   * In the case of supergroups and channels, the user will not be able to
+   * return to the chat on their own using invite links, etc., unless unbanned first..
+   *
+   * The **bot must be an administrator in the group, supergroup or a channel** for this to work.
+   *
+   *
+   * @param {Number|String} chatId   Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Number} userId  Unique identifier of the target user
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success.
+   * @see https://core.telegram.org/bots/api#banchatmember
+   */
   banChatMember(chatId, userId, form = {}) {
     form.chat_id = chatId;
     form.user_id = userId;
@@ -1694,21 +1822,21 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to unban a previously kicked user in a supergroup.
-  * The user will not return to the group automatically, but will be
-  * able to join via link, etc.
-  *
-  * The **bot must be an administrator** in the supergroup or channel for this to work.
-  *
-  * **By default**, this method guarantees that after the call the user is not a member of the chat, but will be able to join it.
-  * So **if the user is a member of the chat they will also be removed from the chat**. If you don't want this, use the parameter *only_if_banned*
-  *
-  * @param {Number|String} chatId   Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {Number} userId  Unique identifier of the target user
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#unbanchatmember
-  */
+   * Use this method to unban a previously kicked user in a supergroup.
+   * The user will not return to the group automatically, but will be
+   * able to join via link, etc.
+   *
+   * The **bot must be an administrator** in the supergroup or channel for this to work.
+   *
+   * **By default**, this method guarantees that after the call the user is not a member of the chat, but will be able to join it.
+   * So **if the user is a member of the chat they will also be removed from the chat**. If you don't want this, use the parameter *only_if_banned*
+   *
+   * @param {Number|String} chatId   Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Number} userId  Unique identifier of the target user
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#unbanchatmember
+   */
   unbanChatMember(chatId, userId, form = {}) {
     form.chat_id = chatId;
     form.user_id = userId;
@@ -1716,17 +1844,17 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to restrict a user in a supergroup.
-  * The bot **must be an administrator in the supergroup** for this to work
-  * and must have the appropriate admin rights. Pass True for all boolean parameters
-  * to lift restrictions from a user. Returns True on success.
-  *
-  * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {Number} userId Unique identifier of the target user
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#restrictchatmember
-  */
+   * Use this method to restrict a user in a supergroup.
+   * The bot **must be an administrator in the supergroup** for this to work
+   * and must have the appropriate admin rights. Pass True for all boolean parameters
+   * to lift restrictions from a user. Returns True on success.
+   *
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Number} userId Unique identifier of the target user
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#restrictchatmember
+   */
   restrictChatMember(chatId, userId, form = {}) {
     form.chat_id = chatId;
     form.user_id = userId;
@@ -1767,7 +1895,6 @@ class TelegramBot extends EventEmitter {
     return this._request('setChatAdministratorCustomTitle', { form });
   }
 
-
   /**
    * Use this method to ban a channel chat in a supergroup or a channel.
    *
@@ -1787,16 +1914,16 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to unban a previously banned channel chat in a supergroup or channel.
-  *
-  * The bot **must be an administrator** for this to work and must have the appropriate administrator rights.
-  *
-  * @param {Number|String} chatId Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {Number} senderChatId Unique identifier of the target user
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#unbanchatsenderchat
-  */
+   * Use this method to unban a previously banned channel chat in a supergroup or channel.
+   *
+   * The bot **must be an administrator** for this to work and must have the appropriate administrator rights.
+   *
+   * @param {Number|String} chatId Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Number} senderChatId Unique identifier of the target user
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#unbanchatsenderchat
+   */
   unbanChatSenderChat(chatId, senderChatId, form = {}) {
     form.chat_id = chatId;
     form.sender_chat_id = senderChatId;
@@ -1882,7 +2009,12 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} The new invite link as a [ChatInviteLink](https://core.telegram.org/bots/api#chatinvitelink) object
    * @see https://core.telegram.org/bots/api#createchatsubscriptioninvitelink
    */
-  createChatSubscriptionInviteLink(chatId, subscriptionPeriod, subscriptionPrice, form = {}) {
+  createChatSubscriptionInviteLink(
+    chatId,
+    subscriptionPeriod,
+    subscriptionPrice,
+    form = {}
+  ) {
     form.chat_id = chatId;
     form.subscription_period = subscriptionPeriod;
     form.subscription_price = subscriptionPrice;
@@ -1986,15 +2118,15 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to delete a chat photo. **Photos can't be changed for private chats**.
-  *
-  * The bot **must be an administrator in the chat** for this to work and must have the appropriate admin rights.
-  *
-  * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#deletechatphoto
-  */
+   * Use this method to delete a chat photo. **Photos can't be changed for private chats**.
+   *
+   * The bot **must be an administrator in the chat** for this to work and must have the appropriate admin rights.
+   *
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#deletechatphoto
+   */
   deleteChatPhoto(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('deleteChatPhoto', { form });
@@ -2069,16 +2201,16 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to clear the list of pinned messages in a chat.
-  *
-  * If the chat is not a private chat, the **bot must be an administrator in the chat** for this to work and must have the `can_pin_messages` administrator
-  * right in a supergroup or `can_edit_messages` administrator right in a channel.
-  *
-  * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#unpinallchatmessages
-  */
+   * Use this method to clear the list of pinned messages in a chat.
+   *
+   * If the chat is not a private chat, the **bot must be an administrator in the chat** for this to work and must have the `can_pin_messages` administrator
+   * right in a supergroup or `can_edit_messages` administrator right in a channel.
+   *
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format `@channelusername`)
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#unpinallchatmessages
+   */
   unpinAllChatMessages(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('unpinAllChatMessages', { form });
@@ -2126,13 +2258,13 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to get the number of members in a chat.
-  *
-  * @param {Number|String} chatId  Unique identifier for the target group or username of the target supergroup
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} Int on success
-  * @see https://core.telegram.org/bots/api#getchatmembercount
-  */
+   * Use this method to get the number of members in a chat.
+   *
+   * @param {Number|String} chatId  Unique identifier for the target group or username of the target supergroup
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} Int on success
+   * @see https://core.telegram.org/bots/api#getchatmembercount
+   */
   getChatMemberCount(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('getChatMemberCount', { form });
@@ -2171,7 +2303,6 @@ class TelegramBot extends EventEmitter {
     form.sticker_set_name = stickerSetName;
     return this._request('setChatStickerSet', { form });
   }
-
 
   /**
    * Use this method to delete a group sticker set from a supergroup.
@@ -2299,16 +2430,16 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to edit the name of the 'General' topic in a forum supergroup chat.
-  * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
-  * The topic will be automatically unhidden if it was hidden.
-  *
-  * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
-  * @param {String} name New topic name, 1-128 characters
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#editgeneralforumtopic
-  */
+   * Use this method to edit the name of the 'General' topic in a forum supergroup chat.
+   * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
+   * The topic will be automatically unhidden if it was hidden.
+   *
+   * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
+   * @param {String} name New topic name, 1-128 characters
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#editgeneralforumtopic
+   */
   editGeneralForumTopic(chatId, name, form = {}) {
     form.chat_id = chatId;
     form.name = name;
@@ -2316,45 +2447,45 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to close an open 'General' topic in a forum supergroup chat.
-  * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
-  * The topic will be automatically unhidden if it was hidden.
-  *
-  * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#closegeneralforumtopic
-  */
+   * Use this method to close an open 'General' topic in a forum supergroup chat.
+   * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
+   * The topic will be automatically unhidden if it was hidden.
+   *
+   * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#closegeneralforumtopic
+   */
   closeGeneralForumTopic(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('closeGeneralForumTopic', { form });
   }
 
   /**
-  * Use this method to reopen a closed 'General' topic in a forum supergroup chat.
-  * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
-  * The topic will be automatically unhidden if it was hidden.
-  *
-  * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#reopengeneralforumtopic
-  */
+   * Use this method to reopen a closed 'General' topic in a forum supergroup chat.
+   * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
+   * The topic will be automatically unhidden if it was hidden.
+   *
+   * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#reopengeneralforumtopic
+   */
   reopenGeneralForumTopic(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('reopenGeneralForumTopic', { form });
   }
 
   /**
-  * Use this method to hide the 'General' topic in a forum supergroup chat.
-  * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
-  * The topic will be automatically closed if it was open.
-  *
-  * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} True on success
-  * @see https://core.telegram.org/bots/api#hidegeneralforumtopic
-  */
+   * Use this method to hide the 'General' topic in a forum supergroup chat.
+   * The bot must be an administrator in the chat for this to work and must have the can_manage_topics administrator rights.
+   * The topic will be automatically closed if it was open.
+   *
+   * @param {Number|String} chatId Unique identifier for the target group or username of the target supergroup (in the format @supergroupusername)
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#hidegeneralforumtopic
+   */
   hideGeneralForumTopic(chatId, form = {}) {
     form.chat_id = chatId;
     return this._request('hideGeneralForumTopic', { form });
@@ -2408,7 +2539,9 @@ class TelegramBot extends EventEmitter {
      * consistency of the method signatures throughout the library */
     if (typeof form !== 'object') {
       /* eslint-disable no-param-reassign, prefer-rest-params */
-      deprecate('The method signature answerCallbackQuery(callbackQueryId, text, showAlert) has been deprecated since v0.27.1');
+      deprecate(
+        'The method signature answerCallbackQuery(callbackQueryId, text, showAlert) has been deprecated since v0.27.1'
+      );
       form = {
         callback_query_id: arguments[0],
         text: arguments[1],
@@ -2421,7 +2554,9 @@ class TelegramBot extends EventEmitter {
      * consistency of the method signatures throughout the library. */
     if (typeof callbackQueryId === 'object') {
       /* eslint-disable no-param-reassign, prefer-rest-params */
-      deprecate('The method signature answerCallbackQuery([options]) has been deprecated since v0.29.0');
+      deprecate(
+        'The method signature answerCallbackQuery([options]) has been deprecated since v0.29.0'
+      );
       form = callbackQueryId;
       /* eslint-enable no-param-reassign, prefer-rest-params */
     } else {
@@ -2506,7 +2641,6 @@ class TelegramBot extends EventEmitter {
   deleteMyCommands(form = {}) {
     return this._request('deleteMyCommands', { form });
   }
-
 
   /**
    * Use this method to get the current list of the bot's commands for the given scope and user language.
@@ -2707,7 +2841,9 @@ class TelegramBot extends EventEmitter {
           opts.formData[attachName] = formData[attachName];
           payload.media = `attach://${attachName}`;
         } else {
-          throw new errors.FatalError(`Failed to process the replacement action for your ${media.type}`);
+          throw new errors.FatalError(
+            `Failed to process the replacement action for your ${media.type}`
+          );
         }
       } catch (ex) {
         return Promise.reject(ex);
@@ -2733,7 +2869,13 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} On success, the sent [Message](https://core.telegram.org/bots/api#message) object is returned.
    * @see https://core.telegram.org/bots/api#editmessagechecklist
    */
-  editMessageChecklist(businessConnectionId, chatId, messageId, checklist, form = {}) {
+  editMessageChecklist(
+    businessConnectionId,
+    chatId,
+    messageId,
+    checklist,
+    form = {}
+  ) {
     form.business_connection_id = businessConnectionId;
     form.chat_id = chatId;
     form.message_id = messageId;
@@ -2755,7 +2897,6 @@ class TelegramBot extends EventEmitter {
     form.reply_markup = replyMarkup;
     return this._request('editMessageReplyMarkup', { form });
   }
-
 
   /**
    * Use this method to stop a poll which was sent by the bot.
@@ -2785,7 +2926,7 @@ class TelegramBot extends EventEmitter {
    */
   sendSticker(chatId, sticker, options = {}, fileOptions = {}) {
     const opts = {
-      qs: options
+      qs: options,
     };
     opts.qs.chat_id = chatId;
     try {
@@ -2836,7 +2977,13 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} On success, a [File](https://core.telegram.org/bots/api#file) object is returned
    * @see https://core.telegram.org/bots/api#uploadstickerfile
    */
-  uploadStickerFile(userId, sticker, stickerFormat = 'static', options = {}, fileOptions = {}) {
+  uploadStickerFile(
+    userId,
+    sticker,
+    stickerFormat = 'static',
+    options = {},
+    fileOptions = {}
+  ) {
     const opts = {
       qs: options,
     };
@@ -2872,7 +3019,15 @@ class TelegramBot extends EventEmitter {
    * @return {Promise}  True on success
    * @see https://core.telegram.org/bots/api#createnewstickerset
    */
-  createNewStickerSet(userId, name, title, pngSticker, emojis, options = {}, fileOptions = {}) {
+  createNewStickerSet(
+    userId,
+    name,
+    title,
+    pngSticker,
+    emojis,
+    options = {},
+    fileOptions = {}
+  ) {
     const opts = {
       qs: options,
     };
@@ -2882,7 +3037,11 @@ class TelegramBot extends EventEmitter {
     opts.qs.emojis = emojis;
     opts.qs.mask_position = stringify(options.mask_position);
     try {
-      const sendData = this._formatSendData('png_sticker', pngSticker, fileOptions);
+      const sendData = this._formatSendData(
+        'png_sticker',
+        pngSticker,
+        fileOptions
+      );
       opts.formData = sendData[0];
       opts.qs.png_sticker = sendData[1];
     } catch (ex) {
@@ -2914,7 +3073,15 @@ class TelegramBot extends EventEmitter {
    * @return {Promise}  True on success
    * @see https://core.telegram.org/bots/api#addstickertoset
    */
-  addStickerToSet(userId, name, sticker, emojis, stickerType = 'png_sticker', options = {}, fileOptions = {}) {
+  addStickerToSet(
+    userId,
+    name,
+    sticker,
+    emojis,
+    stickerType = 'png_sticker',
+    options = {},
+    fileOptions = {}
+  ) {
     const opts = {
       qs: options,
     };
@@ -2923,8 +3090,15 @@ class TelegramBot extends EventEmitter {
     opts.qs.emojis = emojis;
     opts.qs.mask_position = stringify(options.mask_position);
 
-    if (typeof stickerType !== 'string' || ['png_sticker', 'tgs_sticker', 'webm_sticker'].indexOf(stickerType) === -1) {
-      return Promise.reject(new Error('stickerType must be a string and the allow types is: png_sticker, tgs_sticker, webm_sticker'));
+    if (
+      typeof stickerType !== 'string' ||
+      ['png_sticker', 'tgs_sticker', 'webm_sticker'].indexOf(stickerType) === -1
+    ) {
+      return Promise.reject(
+        new Error(
+          'stickerType must be a string and the allow types is: png_sticker, tgs_sticker, webm_sticker'
+        )
+      );
     }
 
     try {
@@ -2983,7 +3157,6 @@ class TelegramBot extends EventEmitter {
     form.old_sticker = oldSticker;
     return this._request('deleteStickerFromSet', { form });
   }
-
 
   /**
    * Use this method to change the list of emoji assigned to a regular or custom emoji sticker.
@@ -3073,7 +3246,13 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} True on success
    * @see https://core.telegram.org/bots/api#setstickersetthumbnail
    */
-  setStickerSetThumbnail(userId, name, thumbnail, options = {}, fileOptions = {}) {
+  setStickerSetThumbnail(
+    userId,
+    name,
+    thumbnail,
+    options = {},
+    fileOptions = {}
+  ) {
     const opts = {
       qs: options,
     };
@@ -3081,7 +3260,11 @@ class TelegramBot extends EventEmitter {
     opts.qs.name = name;
     opts.qs.mask_position = stringify(options.mask_position);
     try {
-      const sendData = this._formatSendData('thumbnail', thumbnail, fileOptions);
+      const sendData = this._formatSendData(
+        'thumbnail',
+        thumbnail,
+        fileOptions
+      );
       opts.formData = sendData[0];
       opts.qs.thumbnail = sendData[1];
     } catch (ex) {
@@ -3089,7 +3272,6 @@ class TelegramBot extends EventEmitter {
     }
     return this._request('setStickerSetThumbnail', opts);
   }
-
 
   /**
    * Use this method to set the thumbnail of a custom emoji sticker set.
@@ -3168,7 +3350,16 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} On success, the sent [Message](https://core.telegram.org/bots/api#message) is returned
    * @see https://core.telegram.org/bots/api#sendinvoice
    */
-  sendInvoice(chatId, title, description, payload, providerToken, currency, prices, form = {}) {
+  sendInvoice(
+    chatId,
+    title,
+    description,
+    payload,
+    providerToken,
+    currency,
+    prices,
+    form = {}
+  ) {
     form.chat_id = chatId;
     form.title = title;
     form.description = description;
@@ -3184,19 +3375,27 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to create a link for an invoice.
-  *
-  * @param {String} title Product name, 1-32 characters
-  * @param {String} description Product description, 1-255 characters
-  * @param {String} payload Bot defined invoice payload
-  * @param {String} providerToken Payment provider token
-  * @param {String} currency Three-letter ISO 4217 currency code
-  * @param {Array} prices Breakdown of prices
-  * @param {Object} [options] Additional Telegram query options
-  * @returns {Promise} The created invoice link as String on success.
-  * @see https://core.telegram.org/bots/api#createinvoicelink
-  */
-  createInvoiceLink(title, description, payload, providerToken, currency, prices, form = {}) {
+   * Use this method to create a link for an invoice.
+   *
+   * @param {String} title Product name, 1-32 characters
+   * @param {String} description Product description, 1-255 characters
+   * @param {String} payload Bot defined invoice payload
+   * @param {String} providerToken Payment provider token
+   * @param {String} currency Three-letter ISO 4217 currency code
+   * @param {Array} prices Breakdown of prices
+   * @param {Object} [options] Additional Telegram query options
+   * @returns {Promise} The created invoice link as String on success.
+   * @see https://core.telegram.org/bots/api#createinvoicelink
+   */
+  createInvoiceLink(
+    title,
+    description,
+    payload,
+    providerToken,
+    currency,
+    prices,
+    form = {}
+  ) {
     form.title = title;
     form.description = description;
     form.payload = payload;
@@ -3207,17 +3406,17 @@ class TelegramBot extends EventEmitter {
   }
 
   /**
-  * Use this method to reply to shipping queries.
-  *
-  * If you sent an invoice requesting a shipping address and the parameter is_flexible was specified,
-  * the Bot API will send an [Update](https://core.telegram.org/bots/api#update) with a shipping_query field to the bot
-  *
-  * @param {String} shippingQueryId  Unique identifier for the query to be answered
-  * @param {Boolean} ok Specify if delivery of the product is possible
-  * @param {Object} [options] Additional Telegram query options
-  * @return {Promise} On success, True is returned
-  * @see https://core.telegram.org/bots/api#answershippingquery
-  */
+   * Use this method to reply to shipping queries.
+   *
+   * If you sent an invoice requesting a shipping address and the parameter is_flexible was specified,
+   * the Bot API will send an [Update](https://core.telegram.org/bots/api#update) with a shipping_query field to the bot
+   *
+   * @param {String} shippingQueryId  Unique identifier for the query to be answered
+   * @param {Boolean} ok Specify if delivery of the product is possible
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} On success, True is returned
+   * @see https://core.telegram.org/bots/api#answershippingquery
+   */
   answerShippingQuery(shippingQueryId, ok, form = {}) {
     form.shipping_query_id = shippingQueryId;
     form.ok = ok;
@@ -3292,7 +3491,12 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} On success, True is returned
    * @see https://core.telegram.org/bots/api#cancelrenewsubscription
    */
-  editUserStarSubscription(userId, telegramPaymentChargeId, isCanceled, form = {}) {
+  editUserStarSubscription(
+    userId,
+    telegramPaymentChargeId,
+    isCanceled,
+    form = {}
+  ) {
     form.user_id = userId;
     form.telegram_payment_charge_id = telegramPaymentChargeId;
     form.is_canceled = isCanceled;
@@ -3344,23 +3548,22 @@ class TelegramBot extends EventEmitter {
     return this._request('getGameHighScores', { form });
   }
 
-
   /**
- * Use this method to delete a message, including service messages, with the following limitations:
- * - A message can only be deleted if it was sent less than 48 hours ago.
- * - A dice message can only be deleted if it was sent more than 24 hours ago.
- * - Bots can delete outgoing messages in groups and supergroups.
- * - Bots can delete incoming messages in groups, supergroups and channels.
- * - Bots granted `can_post_messages` permissions can delete outgoing messages in channels.
- * - If the bot is an administrator of a group, it can delete any message there.
- * - If the bot has `can_delete_messages` permission in a supergroup, it can delete any message there.
- *
- * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format @channelusername)
- * @param {Number} messageId  Unique identifier of the target message
- * @param {Object} [options] Additional Telegram query options
- * @return {Promise} True on success
- * @see https://core.telegram.org/bots/api#deletemessage
- */
+   * Use this method to delete a message, including service messages, with the following limitations:
+   * - A message can only be deleted if it was sent less than 48 hours ago.
+   * - A dice message can only be deleted if it was sent more than 24 hours ago.
+   * - Bots can delete outgoing messages in groups and supergroups.
+   * - Bots can delete incoming messages in groups, supergroups and channels.
+   * - Bots granted `can_post_messages` permissions can delete outgoing messages in channels.
+   * - If the bot is an administrator of a group, it can delete any message there.
+   * - If the bot has `can_delete_messages` permission in a supergroup, it can delete any message there.
+   *
+   * @param {Number|String} chatId  Unique identifier for the target chat or username of the target channel (in the format @channelusername)
+   * @param {Number} messageId  Unique identifier of the target message
+   * @param {Object} [options] Additional Telegram query options
+   * @return {Promise} True on success
+   * @see https://core.telegram.org/bots/api#deletemessage
+   */
   deleteMessage(chatId, messageId, form = {}) {
     form.chat_id = chatId;
     form.message_id = messageId;
@@ -3614,7 +3817,12 @@ class TelegramBot extends EventEmitter {
    * @return {Promise} On success, returns true.
    * @see https://core.telegram.org/bots/api#setbusinessaccountgiftsettings
    */
-  setBusinessAccountGiftSettings(businessConnectionId, showGiftButton, acceptedGiftTypes, form = {}) {
+  setBusinessAccountGiftSettings(
+    businessConnectionId,
+    showGiftButton,
+    acceptedGiftTypes,
+    form = {}
+  ) {
     form.business_connection_id = businessConnectionId;
     form.show_gift_button = showGiftButton;
     form.accepted_gift_types = acceptedGiftTypes;
@@ -3751,7 +3959,9 @@ class TelegramBot extends EventEmitter {
         return Promise.reject(new Error('content.type is required'));
       }
 
-      const { formData, fileIds } = this._formatSendMultipleData(content.type, [content]);
+      const { formData, fileIds } = this._formatSendMultipleData(content.type, [
+        content,
+      ]);
 
       opts.formData = formData;
 
@@ -3797,7 +4007,9 @@ class TelegramBot extends EventEmitter {
         return Promise.reject(new Error('content.type is required'));
       }
 
-      const { formData, fileIds } = this._formatSendMultipleData(content.type, [content]);
+      const { formData, fileIds } = this._formatSendMultipleData(content.type, [
+        content,
+      ]);
 
       opts.formData = formData;
 
@@ -3815,7 +4027,6 @@ class TelegramBot extends EventEmitter {
     return this._request('editStory', opts);
   }
 
-
   /**
    * This method deletes a story previously posted by the bot on behalf of a managed business account.
    *
@@ -3832,7 +4043,6 @@ class TelegramBot extends EventEmitter {
     form.story_id = storyId;
     return this._request('deleteStory', { form });
   }
-
 }
 
 module.exports = TelegramBot;
